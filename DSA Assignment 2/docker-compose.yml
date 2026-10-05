@@ -1,0 +1,188 @@
+name: food-delivery
+
+# Build the service jars first (scripts/build-all.ps1 or scripts/build-all.sh),
+# then: docker compose up -d --build
+#
+# Memory: the defaults below fit the whole platform in ~3.5 GB. Raise
+# JAVA_TOOL_OPTIONS / mem_limit if a service is OOM-killed.
+
+x-ballerina-service: &ballerina-service
+  restart: unless-stopped
+  networks: [backend]
+  depends_on:
+    kafka-init:
+      condition: service_completed_successfully
+    mongo:
+      condition: service_healthy
+  mem_limit: 320m
+
+x-ballerina-env: &ballerina-env
+  BAL_CONFIG_VAR_KAFKABOOTSTRAP: kafka:29092
+  JAVA_TOOL_OPTIONS: "-Xms48m -Xmx192m -XX:+UseSerialGC -XX:TieredStopAtLevel=1"
+
+services:
+  # ------------------------------------------------------------- infrastructure
+  kafka:
+    image: apache/kafka:3.8.0
+    hostname: kafka
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "9092:9092"   # for services run on the host with `bal run`
+    environment:
+      # Single-node KRaft (no ZooKeeper): this node is broker and controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL is used by containers, HOST by processes on your machine.
+      KAFKA_LISTENERS: INTERNAL://:29092,HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Topics are created explicitly by kafka-init with chosen partition counts.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # A plain TCP check: the Kafka CLI tools start a whole JVM and time out
+      # on low-RAM machines. kafka-init still waits for a real broker response.
+      test: ["CMD", "bash", "-c", "</dev/tcp/localhost/29092"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    networks: [backend]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP: kafka:29092
+      KAFKA_HEAP_OPTS: "-Xmx128m"
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    restart: "no"
+
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "27017:27017"   # for MongoDB Compass / services run on the host
+    command: ["--wiredTigerCacheSizeGB", "0.25"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-root-dev-pass}
+      MONGO_SERVICE_PASSWORD: ${MONGO_SERVICE_PASSWORD:-dev-service-pass}
+    volumes:
+      - mongo-data:/data/db
+      - ./infra/mongo/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    healthcheck:
+      # TCP check rather than mongosh, which is a Node app and too slow to
+      # start on low-RAM machines.
+      test: ["CMD", "bash", "-c", "</dev/tcp/localhost/27017"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ------------------------------------------------------------- microservices
+  customer-service:
+    <<: *ballerina-service
+    build: ./services/customer-service
+    ports: ["8081:8081"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://customer_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/customer_db?authSource=customer_db
+
+  restaurant-service:
+    <<: *ballerina-service
+    build: ./services/restaurant-service
+    ports: ["8082:8082"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://restaurant_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/restaurant_db?authSource=restaurant_db
+
+  order-service:
+    <<: *ballerina-service
+    build: ./services/order-service
+    ports: ["8083:8083"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://order_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/order_db?authSource=order_db
+
+  payment-service:
+    <<: *ballerina-service
+    build: ./services/payment-service
+    ports: ["8084:8084"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://payment_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/payment_db?authSource=payment_db
+
+  delivery-service:
+    <<: *ballerina-service
+    build: ./services/delivery-service
+    ports: ["8085:8085"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://delivery_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/delivery_db?authSource=delivery_db
+
+  notification-service:
+    <<: *ballerina-service
+    build: ./services/notification-service
+    ports: ["8086:8086"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://notification_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/notification_db?authSource=notification_db
+
+  admin-service:
+    <<: *ballerina-service
+    build: ./services/admin-service
+    ports: ["8087:8087"]
+    environment:
+      <<: *ballerina-env
+      BAL_CONFIG_VAR_MONGOURI: mongodb://admin_svc:${MONGO_SERVICE_PASSWORD:-dev-service-pass}@mongo:27017/admin_db?authSource=admin_db
+
+  # ------------------------------------------------------------------- web UI
+  # Static single-page app at http://localhost:8080. The browser calls the
+  # service APIs on ports 8081-8087 directly (CORS is enabled on each).
+  web:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports: ["8080:80"]
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+    mem_limit: 32m
+
+  # ------------------------------------------------- optional tools (profile)
+  # docker compose --profile tools up -d kafka-ui   ->  http://localhost:8090
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    profiles: ["tools"]
+    networks: [backend]
+    ports: ["8090:8080"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: food-delivery
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      JAVA_OPTS: "-Xmx256m"
+
+networks:
+  backend:
+    name: food-delivery-backend
+
+volumes:
+  kafka-data:
+  mongo-data:
