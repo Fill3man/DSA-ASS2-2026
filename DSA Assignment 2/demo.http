@@ -1,0 +1,134 @@
+### Food Delivery Platform - clickable requests
+### Needs the VS Code extension "REST Client" (humao.rest-client).
+### Click "Send Request" above each one. Run top to bottom; start the stack first.
+### (The browser UI at http://localhost:8080 does all of this with buttons.)
+
+@customers = http://localhost:8081/api/v1
+@restaurants = http://localhost:8082/api/v1
+@orders = http://localhost:8083/api/v1
+@payments = http://localhost:8084/api/v1
+@delivery = http://localhost:8085/api/v1
+@notifications = http://localhost:8086/api/v1
+@admin = http://localhost:8087/api/v1
+
+### 0. Browse: customers, restaurants (with openNow), a menu
+GET {{customers}}/customers
+###
+GET {{restaurants}}/restaurants
+###
+GET {{restaurants}}/restaurants/rest-001/menu
+
+### 1. CUSTOMER places an order
+# @name newOrder
+POST {{orders}}/orders
+Content-Type: application/json
+
+{
+  "customerId": "cust-001",
+  "restaurantId": "rest-001",
+  "items": [
+    { "itemId": "item-001", "name": "Kapana (6 pieces)", "quantity": 2, "unitPrice": 45.00 },
+    { "itemId": "item-002", "name": "Fat cakes", "quantity": 3, "unitPrice": 15.00 }
+  ],
+  "deliveryAddress": { "street": "12 Robert Mugabe Ave", "city": "Windhoek", "latitude": -22.57, "longitude": 17.0836 }
+}
+
+@orderId = {{newOrder.response.body.orderId}}
+
+### 2. Wait ~2 s: payment-service has charged it -> CONFIRMED
+GET {{orders}}/orders/{{orderId}}
+###
+GET {{payments}}/payments?orderId={{orderId}}
+
+### 3. delivery-service has assigned the nearest driver
+# @name delivery
+GET {{delivery}}/deliveries/order/{{orderId}}
+
+@deliveryId = {{delivery.response.body.deliveryId}}
+
+### 4a. RESTAURANT starts cooking
+PATCH {{orders}}/orders/{{orderId}}/status
+Content-Type: application/json
+
+{ "status": "PREPARING" }
+
+### 4b. RESTAURANT marks it ready
+PATCH {{orders}}/orders/{{orderId}}/status
+Content-Type: application/json
+
+{ "status": "READY" }
+
+### 5a. DRIVER picks up -> OUT_FOR_DELIVERY
+POST {{delivery}}/deliveries/{{deliveryId}}/pickup
+
+### 5b. DRIVER delivers -> DELIVERED
+POST {{delivery}}/deliveries/{{deliveryId}}/complete
+
+### 6. Audit trail, notifications, customer history
+GET {{orders}}/orders/{{orderId}}/history
+###
+GET {{notifications}}/notifications/order/{{orderId}}
+###
+GET {{customers}}/customers/cust-001/orders
+
+### 7. Reports
+GET {{admin}}/reports/summary
+###
+GET {{admin}}/reports/restaurants
+###
+GET {{admin}}/reports/delivery-performance
+
+### 8. Guard rails: cancel after delivery -> 409; event-only status -> 400
+POST {{orders}}/orders/{{orderId}}/cancel
+###
+PATCH {{orders}}/orders/{{orderId}}/status
+Content-Type: application/json
+
+{ "status": "DELIVERED" }
+
+### 9. Failure path: over the NAD 2000 card limit -> declined -> CANCELLED
+# @name bigOrder
+POST {{orders}}/orders
+Content-Type: application/json
+
+{
+  "customerId": "cust-002", "restaurantId": "rest-001",
+  "items": [{ "itemId": "item-003", "name": "Oshifima & stew", "quantity": 35, "unitPrice": 65.00 }],
+  "deliveryAddress": { "street": "13 Jackson Kaujeua St", "city": "Windhoek" }
+}
+
+### (send ~2 s later)
+GET {{orders}}/orders/{{bigOrder.response.body.orderId}}/history
+
+### 10. Cancel a paid order -> payment REFUNDED, stock returned, driver freed
+# @name toCancel
+POST {{orders}}/orders
+Content-Type: application/json
+
+{
+  "customerId": "cust-002", "restaurantId": "rest-001",
+  "items": [{ "itemId": "item-002", "name": "Fat cakes", "quantity": 2, "unitPrice": 15.00 }],
+  "deliveryAddress": { "street": "13 Jackson Kaujeua St", "city": "Windhoek" }
+}
+
+### (send ~2 s later, once CONFIRMED)
+POST {{orders}}/orders/{{toCancel.response.body.orderId}}/cancel
+Content-Type: application/json
+
+{ "reason": "changed my mind" }
+
+###
+GET {{payments}}/payments?orderId={{toCancel.response.body.orderId}}
+
+### 11. Drivers: list, go online/offline, move
+GET {{delivery}}/drivers
+###
+PATCH {{delivery}}/drivers/drv-003/status
+Content-Type: application/json
+
+{ "status": "AVAILABLE" }
+###
+PUT {{delivery}}/drivers/drv-003/location
+Content-Type: application/json
+
+{ "latitude": -22.556, "longitude": 17.072 }
